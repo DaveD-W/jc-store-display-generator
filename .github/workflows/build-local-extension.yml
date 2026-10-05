@@ -1,0 +1,148 @@
+name: Build local Chrome extension
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'extension-build/**'
+      - '.github/workflows/build-local-extension.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Restore base extension package
+        run: |
+          mkdir -p build/extension
+          base64 -d extension-build/extension-base-v1.2.b64.txt > build/base.zip
+          unzip -q build/base.zip -d build/extension
+
+      - name: Vendor runtime libraries and font
+        run: |
+          set -euxo pipefail
+          cd build/extension
+          mkdir -p lib fonts licenses
+          curl -fL "https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js" -o lib/jszip.min.js
+          curl -fL "https://cdn.jsdelivr.net/npm/opentype.js@1.3.1/dist/opentype.min.js" -o lib/opentype.min.js
+          curl -fL "https://cdn.jsdelivr.net/npm/earcut@2.2.4/dist/earcut.min.js" -o lib/earcut.min.js
+          curl -fL "https://raw.githubusercontent.com/tokotype/PlusJakartaSans/master/fonts/ttf/PlusJakartaSans-ExtraBold.ttf" -o fonts/PlusJakartaSans-ExtraBold.ttf
+
+          curl -fL "https://raw.githubusercontent.com/Stuk/jszip/v3.10.1/LICENSE.markdown" -o licenses/JSZip-LICENSE.md
+          curl -fL "https://raw.githubusercontent.com/opentypejs/opentype.js/1.3.1/LICENSE" -o licenses/opentype.js-LICENSE
+          curl -fL "https://raw.githubusercontent.com/mapbox/earcut/v2.2.4/LICENSE" -o licenses/Earcut-LICENSE
+          curl -fL "https://raw.githubusercontent.com/tokotype/PlusJakartaSans/master/OFL.txt" -o licenses/Plus-Jakarta-Sans-OFL-1.1.txt
+
+      - name: Convert extension to fully local runtime
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import json, re
+
+          root = Path("build/extension")
+          app = root / "app.html"
+          html = app.read_text(encoding="utf-8")
+
+          replacements = {
+              "https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js": "lib/jszip.min.js",
+              "https://cdn.jsdelivr.net/npm/opentype.js@1.3.1/dist/opentype.min.js": "lib/opentype.min.js",
+              "https://cdn.jsdelivr.net/npm/earcut@2.2.4/dist/earcut.min.js": "lib/earcut.min.js",
+              "https://raw.githubusercontent.com/tokotype/PlusJakartaSans/master/fonts/ttf/PlusJakartaSans-ExtraBold.ttf": "fonts/PlusJakartaSans-ExtraBold.ttf",
+          }
+          for old, new in replacements.items():
+              if old not in html:
+                  raise SystemExit(f"Expected remote reference missing: {old}")
+              html = html.replace(old, new)
+
+          app.write_text(html, encoding="utf-8")
+
+          manifest_path = root / "manifest.json"
+          manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+          manifest["version"] = "1.3.0"
+          manifest["content_security_policy"]["sandbox"] = (
+              "sandbox allow-scripts allow-downloads allow-popups allow-popups-to-escape-sandbox; "
+              "script-src 'self' 'unsafe-inline'; "
+              "connect-src 'self'; "
+              "style-src 'self' 'unsafe-inline'; "
+              "img-src 'self' data: blob:; "
+              "font-src 'self' data:;"
+          )
+          manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+          privacy = root / "PRIVACY.txt"
+          if privacy.exists():
+              privacy.write_text(
+                  "Privacy\n=======\n\n"
+                  "JC Store Display Name Generator does not collect, store, sell, or transmit personal data.\n\n"
+                  "3MF files selected by the user, names entered into the generator, and generated files are processed locally within the user's browser. "
+                  "This information is not uploaded to or stored by the developer.\n\n"
+                  "All runtime libraries and the required font are packaged with the extension. "
+                  "The extension does not transmit the selected 3MF, entered name, or generated file to external services.\n\n"
+                  "No browsing history, website content, location, authentication information, financial information, or other personal information is collected.\n",
+                  encoding="utf-8"
+              )
+
+          readme = root / "README.txt"
+          if readme.exists():
+              txt = readme.read_text(encoding="utf-8")
+              txt += "\nOFFLINE OPERATION\nAll runtime libraries and the required font are bundled with the extension. No remote code is loaded.\n"
+              readme.write_text(txt, encoding="utf-8")
+
+          # Release checks.
+          app_text = app.read_text(encoding="utf-8")
+          forbidden = [
+              "cdn.jsdelivr.net",
+              "raw.githubusercontent.com/tokotype/PlusJakartaSans",
+          ]
+          for f in forbidden:
+              if f in app_text:
+                  raise SystemExit(f"Remote runtime reference remains in app.html: {f}")
+
+          required = [
+              root / "lib/jszip.min.js",
+              root / "lib/opentype.min.js",
+              root / "lib/earcut.min.js",
+              root / "fonts/PlusJakartaSans-ExtraBold.ttf",
+          ]
+          for p in required:
+              if not p.exists() or p.stat().st_size == 0:
+                  raise SystemExit(f"Missing vendored file: {p}")
+
+          if app_text.count("async function generate()") != 1:
+              raise SystemExit("Generator function count is not 1")
+          if "white / extruder 1" not in app_text:
+              raise SystemExit("White counter mapping missing")
+          PY
+
+      - name: Verify no remotely hosted executable code
+        run: |
+          set -euxo pipefail
+          cd build/extension
+          test "$(grep -c 'async function generate()' app.html)" -eq 1
+          ! grep -E 'script[^>]+src="https?://' app.html
+          ! grep -E 'FONT_URL *= *"https?://' app.html
+          grep -q '"version": "1.3.0"' manifest.json
+          test -s fonts/PlusJakartaSans-ExtraBold.ttf
+          test -s lib/jszip.min.js
+          test -s lib/opentype.min.js
+          test -s lib/earcut.min.js
+
+      - name: Package Chrome Web Store ZIP
+        run: |
+          cd build/extension
+          zip -qr ../JC-Store-Display-Name-Generator-Chrome-v1.3.zip .
+          cd ..
+          unzip -l JC-Store-Display-Name-Generator-Chrome-v1.3.zip | grep manifest.json
+
+      - name: Upload release package
+        uses: actions/upload-artifact@v4
+        with:
+          name: JC-Store-Display-Name-Generator-Chrome-v1.3
+          path: build/JC-Store-Display-Name-Generator-Chrome-v1.3.zip
+          if-no-files-found: error
