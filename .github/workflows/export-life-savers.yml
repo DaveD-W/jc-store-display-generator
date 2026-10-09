@@ -1,0 +1,19 @@
+name: Export Life Savers font
+
+on:
+  push:
+    paths:
+      - '.github/workflows/export-life-savers.yml'
+      - 'gift-tags/assets/LifeSavers-ExtraBold.ttf'
+  workflow_dispatch:
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LifeSavers-ExtraBold
+          path: gift-tags/assets/LifeSavers-ExtraBold.ttf
+          if-no-files-found: error
